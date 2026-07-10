@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: todo-api
-  namespace: VOTRE_NAMESPACE
+  namespace: goat
   labels:
     app: todo-api
 spec:
@@ -22,7 +22,7 @@ spec:
     spec:
       containers:
         - name: todo-api
-          image: VOTRE_USERNAME/todo-api:latest
+          image: badu6c/todo-api:latest
           ports:
             - containerPort: 5000
           envFrom:

@@ -1,32 +1,13 @@
-name: CI - Test, Build & Push
+name: Hello World
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
 
 jobs:
-  test:
+  hello:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4        # récupère votre code
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install flask pytest
-      - run: pytest test_app.py -v       # lance les tests
-  build-push:
-    runs-on: ubuntu-latest
-    needs: test                          # attend le job test
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: docker/login-action@v3      # connexion Docker Hub
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - uses: docker/build-push-action@v5 # build + push
-        with:
-          context: .
-          push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/todo-api:latest
+      - name: Dire bonjour
+        run: echo "Hello World !"
