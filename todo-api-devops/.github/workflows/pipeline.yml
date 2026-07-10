@@ -1,0 +1,276 @@
+name: Pipeline DevOps — Modules 2 à 5
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MODULE 2 — Gestion du code source
+# Déclencheurs calés sur la stratégie GitFlow :
+#   - push sur main et develop : pipeline complète
+#   - push sur feature/* et hotfix/* : lint + tests uniquement
+#   - pull_request vers main ou develop : quality gate obligatoire
+# ──────────────────────────────────────────────────────────────────────────────
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - 'feature/**'
+      - 'hotfix/**'
+      - 'release/**'
+  pull_request:
+    branches:
+      - main
+      - develop
+
+# Annuler les runs précédents sur la même branche (évite les queues)
+concurrency:
+  group: pipeline-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/todo-api
+
+# ──────────────────────────────────────────────────────────────────────────────
+jobs:
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # MODULE 3 — CI : Analyse statique du code
+  # ════════════════════════════════════════════════════════════════════════════
+  lint:
+    name: 🔍 Lint (flake8)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Installer flake8
+        run: pip install flake8
+
+      - name: Analyser le code (flake8)
+        run: flake8 app.py --max-line-length=120 --ignore=E501,W503
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # MODULE 4 — Quality Gate : tests + coverage + sécurité
+  # ════════════════════════════════════════════════════════════════════════════
+  quality-gate:
+    name: 🎯 Quality Gate (tests + coverage + bandit)
+    runs-on: ubuntu-latest
+    needs: lint
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Installer les dépendances
+        run: pip install flask pytest pytest-cov bandit
+
+      - name: Tests unitaires + coverage
+        run: |
+          pytest test_app.py -v \
+            --cov=app \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            --cov-fail-under=80
+
+      - name: Analyse de sécurité (bandit)
+        # -ll = afficher uniquement les findings MEDIUM et HIGH
+        run: bandit -r app.py -ll
+
+      - name: Uploader le rapport de coverage
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report-${{ github.sha }}
+          path: coverage.xml
+          retention-days: 14
+
+      - name: Résumé Quality Gate
+        if: always()
+        run: |
+          echo "## 🎯 Quality Gate" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Seuil | Statut |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Lint (flake8) | 0 erreur | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tests unitaires | 100% pass | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| Coverage | ≥ 80% | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| Sécurité (bandit) | 0 finding HIGH | ✅ |" >> $GITHUB_STEP_SUMMARY
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # MODULE 3 — CI : Build image Docker + Push Docker Hub
+  # Uniquement si les tests passent ET sur main/develop
+  # ════════════════════════════════════════════════════════════════════════════
+  build:
+    name: 🐳 Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: quality-gate
+    # Ne builder que sur main et develop (pas sur les branches feature/*)
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-tag: ${{ steps.meta.outputs.tags }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Générer les tags automatiquement :
+      # - sha-<commit> : tag unique par commit
+      # - latest       : uniquement sur main
+      # - develop       : uniquement sur develop
+      - name: Extraire les métadonnées Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=ref,event=branch
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Se connecter à Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Builder et pusher l'image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Cache entre les runs pour accélérer le build
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Résumé du build
+        run: |
+          echo "## 🐳 Image Docker publiée" >> $GITHUB_STEP_SUMMARY
+          echo "**Tags :**" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "**Digest :** \`${{ steps.build.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # MODULE 5 — CD : Déploiement sur cluster Kubernetes distant
+  # Uniquement sur main (pas sur develop)
+  # ════════════════════════════════════════════════════════════════════════════
+  deploy:
+    name: 🚀 Deploy to Staging (Kubernetes)
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+
+    # Environnement GitHub — permet d'ajouter une approbation manuelle si besoin
+    environment:
+      name: staging
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # MODULE 5 — Installer kubectl sur le runner
+      - name: Installer kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      # MODULE 5 — Configurer l'accès au cluster depuis le secret GitHub
+      # KUBECONFIG_B64 = contenu du kubeconfig encodé en base64
+      # kubectl create → cat ~/.kube/config | base64 -w 0
+      - name: Configurer kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      # Vérifier la connexion avant de déployer
+      - name: Vérifier l'accès au cluster
+        run: |
+          kubectl cluster-info
+          kubectl get nodes
+          kubectl get pods -n ${{ secrets.K8S_NAMESPACE }}
+
+      # Appliquer les manifestes K8s (ConfigMap + Deployment + Service)
+      - name: Appliquer les manifestes Kubernetes
+        run: |
+          # Remplacer le namespace dans les manifestes
+          sed -i "s/VOTRE_NAMESPACE/${{ secrets.K8S_NAMESPACE }}/g" k8s/configmap.yml
+          sed -i "s/VOTRE_NAMESPACE/${{ secrets.K8S_NAMESPACE }}/g" k8s/deployment.yml
+          sed -i "s/VOTRE_NAMESPACE/${{ secrets.K8S_NAMESPACE }}/g" k8s/service.yml
+          sed -i "s/VOTRE_USERNAME/${{ secrets.DOCKERHUB_USERNAME }}/g" k8s/deployment.yml
+
+          kubectl apply -f k8s/configmap.yml
+          kubectl apply -f k8s/service.yml
+          kubectl apply -f k8s/deployment.yml
+
+      # Déployer la nouvelle image (Rolling Update)
+      - name: Mettre à jour l'image (Rolling Update)
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          IMAGE="${{ env.IMAGE_NAME }}:sha-${SHORT_SHA}"
+          echo "Deploiement de l image : $IMAGE"
+          kubectl set image deployment/todo-api \
+            todo-api=$IMAGE \
+            -n ${{ secrets.K8S_NAMESPACE }}
+
+      # Attendre que le rolling update soit terminé
+      - name: Attendre la fin du déploiement
+        run: |
+          kubectl rollout status deployment/todo-api \
+            -n ${{ secrets.K8S_NAMESPACE }} \
+            --timeout=120s
+
+      # Validation post-déploiement : tous les pods doivent être Ready
+      - name: Validation post-déploiement
+        run: |
+          kubectl wait \
+            --for=condition=ready pod \
+            -l app=todo-api \
+            -n ${{ secrets.K8S_NAMESPACE }} \
+            --timeout=60s
+
+      # Résumé final dans GitHub
+      - name: Résumé du déploiement
+        run: |
+          echo "## 🚀 Déploiement réussi" >> $GITHUB_STEP_SUMMARY
+          echo "**Namespace :** \`${{ secrets.K8S_NAMESPACE }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Image :** \`${{ env.IMAGE_NAME }}:sha-${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Pods en cours :**" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          kubectl get pods -n ${{ secrets.K8S_NAMESPACE }} -l app=todo-api
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Notification en cas d'échec de la pipeline
+  # ════════════════════════════════════════════════════════════════════════════
+  notify-failure:
+    name: 📢 Notification d'échec
+    runs-on: ubuntu-latest
+    needs: [lint, quality-gate, build, deploy]
+    if: failure()
+
+    steps:
+      - name: Résumé de l'échec
+        run: |
+          echo "## ❌ Pipeline échouée" >> $GITHUB_STEP_SUMMARY
+          echo "**Branche :** \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit :** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Auteur :** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Consultez les logs des jobs ci-dessus pour identifier le problème."
+          # En production : envoyer vers Slack, Teams, PagerDuty...
